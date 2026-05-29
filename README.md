@@ -16,7 +16,7 @@ Sozo Read provider repo for book sources. Each `.js` file is a self-contained sc
 
 | File | Site | Type |
 |------|------|------|
-| `zlibrary.js` | Z-Library (`singlelogin.re`) | novel (book library) |
+| `zlibrary.js` | Z-Library (`z-library.sk`) | novel (book library) |
 
 ## Adding a new source
 

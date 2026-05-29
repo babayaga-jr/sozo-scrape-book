@@ -1,16 +1,17 @@
-// Z-Library provider — https://z-lib.org
+// Z-Library provider — https://z-library.sk
 // Book library aggregator. Type is set to 'novel' as the closest match
-// within the Sozo Read provider contract. Search returns book results;
-// getDetail returns full metadata; getChapterContent returns the book
-// description since Z-Library serves whole-book downloads rather than
-// chapter-based text.
+// within the Sozo Read provider contract.
 //
-// NOTE: Z-Library rotates domains frequently. Change SITE below to the
-// current working mirror (e.g. singlelogin.re, zlibrary-global.se, etc.)
-// before distributing.
+// The site uses custom web components (<z-bookcard>, <z-cover>) where
+// most data lives as HTML attributes rather than nested text nodes —
+// ideal for regex-based parsing.
+//
+// NOTE: Z-Library rotates domains. Change SITE below if the current
+// mirror stops working. Known mirrors: z-library.sk, singlelogin.re,
+// zlibrary-global.se
 
 var SOURCE_ID = 'zlibrary';
-var SITE = 'https://singlelogin.re';
+var SITE = 'https://z-library.sk';
 var REFERER = SITE + '/';
 
 function getInfo() {
@@ -44,13 +45,22 @@ function _idFromUrl(url) {
   return m ? m[1] : String(url).replace(/[^a-zA-Z0-9]/g, '');
 }
 
-function _normalizeStatus(s) {
-  s = (s || '').toLowerCase();
-  if (s.indexOf('ongoing') !== -1) return 'ongoing';
-  if (s.indexOf('complete') !== -1 || s.indexOf('finished') !== -1) return 'completed';
-  return 'unknown';
+function _getAttr(tag, name) {
+  if (!tag) return '';
+  var re = new RegExp(name + '="([^"]*)"', 'i');
+  var m = tag.match(re);
+  return m ? _cleanText(m[1]) : '';
 }
 
+// ----------------------------------------------------------------------
+// Search: /s/{query}?page=N
+// Results live inside <div id="searchResultBox"> → <div class="book-item">
+// → <z-bookcard href="..." id="..." extension="..." filesize="..." ...>
+//   <div slot="title">Title</div>
+//   <div slot="author">Author1; Author2</div>
+//   <img data-src="cover_url">
+// </z-bookcard>
+// ----------------------------------------------------------------------
 function search(query, page, opts) {
   page = page || 1;
   opts = opts || {};
@@ -68,64 +78,48 @@ function search(query, page, opts) {
   }).then(function(r) {
     if (r.status !== 200) return [];
     var html = r.body || '';
+
+    var notFound = html.match(/<div[^>]+class="[^"]*notFound[^"]*"/i);
+    if (notFound) return [];
+
     var results = [];
     var seen = {};
 
-    var bookRowRe = /<div[^>]+class="[^"]*bookRow[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>\s*<\/div>/gi;
-    var rows = _allMatches(html, bookRowRe);
+    var cardRe = /<z-bookcard\b([^>]*)>([\s\S]*?)<\/z-bookcard>/gi;
+    var cards = _allMatches(html, cardRe);
 
-    if (rows.length === 0) {
-      var fallbackRe = /<a[^>]+href="(\/book\/\d+\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-      var fallbackMatches = _allMatches(html, fallbackRe);
-      for (var fi = 0; fi < fallbackMatches.length; fi++) {
-        var fHref = fallbackMatches[fi][1];
-        var fLink = absUrl(fHref, SITE);
-        if (seen[fLink]) continue;
-        seen[fLink] = true;
-        var fTitle = _cleanText(fallbackMatches[fi][2]);
-        if (!fTitle || fTitle.length < 2) continue;
+    for (var i = 0; i < cards.length; i++) {
+      var attrs = cards[i][1];
+      var inner = cards[i][2];
 
-        var fIdx = html.indexOf(fallbackMatches[fi][0]);
-        var fSnippet = fIdx >= 0 ? html.substring(Math.max(0, fIdx - 500), fIdx) : '';
-        var fCoverM = fSnippet.match(/<img[^>]+src="([^"]+\.(?:jpg|jpeg|png|webp))"/i);
-        var fCover = fCoverM ? absUrl(fCoverM[1], SITE) : null;
-
-        results.push({
-          id: _idFromUrl(fLink),
-          title: fTitle,
-          cover: fCover,
-          url: fLink,
-          type: 'novel'
-        });
-      }
-      console.log('zlibrary search count (fallback): ' + results.length);
-      return results;
-    }
-
-    for (var i = 0; i < rows.length; i++) {
-      var chunk = rows[i][1];
-
-      var titleM = chunk.match(/<a[^>]+href="(\/book\/\d+\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
-      if (!titleM) continue;
-      var link = absUrl(titleM[1], SITE);
+      var href = _getAttr(attrs, 'href');
+      if (!href) continue;
+      var link = absUrl(href, SITE);
       if (seen[link]) continue;
       seen[link] = true;
-      var title = _cleanText(titleM[2]);
-      if (!title || title.length < 2) continue;
 
-      var coverM = chunk.match(/<img[^>]+src="([^"]+\.(?:jpg|jpeg|png|webp))"/i);
+      var titleSlot = inner.match(/<div[^>]+slot="title"[^>]*>([\s\S]*?)<\/div>/i);
+      var title = titleSlot ? _cleanText(titleSlot[1]) : '';
+
+      var authorSlot = inner.match(/<div[^>]+slot="author"[^>]*>([\s\S]*?)<\/div>/i);
+      var authorRaw = authorSlot ? _cleanText(authorSlot[1]) : '';
+
+      var extension = _getAttr(attrs, 'extension');
+      var size = _getAttr(attrs, 'filesize');
+      var lang = _getAttr(attrs, 'language');
+      var year = _getAttr(attrs, 'year');
+
+      var coverM = inner.match(/<img[^>]+data-src="([^"]+)"/i) ||
+                   inner.match(/<img[^>]+src="([^"]+)"/i);
       var cover = coverM ? absUrl(coverM[1], SITE) : null;
 
-      var authorM = chunk.match(/<a[^>]+class="[^"]*author[^"]*"[^>]*>([^<]+)<\/a>/i);
-      if (!authorM) authorM = chunk.match(/<div[^>]+class="[^"]*authors?[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-      var author = authorM ? _cleanText(authorM[1]) : '';
-
-      var formatM = chunk.match(/(\b(?:pdf|epub|djvu|fb2|mobi|txt|rtf|doc)\b)/i);
-      var format = formatM ? formatM[1].toUpperCase() : '';
+      var displayTitle = title;
+      if (extension) displayTitle = displayTitle + ' [' + extension.toUpperCase() + ']';
+      if (authorRaw) displayTitle = displayTitle + ' — ' + authorRaw;
 
       results.push({
         id: _idFromUrl(link),
-        title: title + (format ? ' [' + format + ']' : ''),
+        title: displayTitle,
         cover: cover,
         url: link,
         type: 'novel'
@@ -136,19 +130,36 @@ function search(query, page, opts) {
   });
 }
 
-function _parseMetaField(html, label) {
+// ----------------------------------------------------------------------
+// Detail page: /book/{id}/{slug}
+// Structure:
+//   <div class="row cardBooks">
+//     <z-cover title="Book Title">
+//       <img class="image" src="cover_url">
+//     </z-cover>
+//     <div class="col-sm-9">
+//       <a href="/s/author">Author Name</a>  (one or more)
+//     </div>
+//     <div id="bookDescriptionBox">Description text</div>
+//     <div class="bookDetailsBox">
+//       <div class="property_year"><div class="property_value">2024</div></div>
+//       <div class="property_publisher"><div class="property_value">...</div></div>
+//       <div class="property_language"><div class="property_value">...</div></div>
+//       <div class="property__file">PDF, 5.4 MB</div>
+//       <div class="property_categories"><div class="property_value">...</div></div>
+//     </div>
+//     <a class="btn btn-default addDownloadedBook" href="/dl/...">Download</a>
+//   </div>
+// ----------------------------------------------------------------------
+function _parseDetailProperty(html, prop) {
   var re = new RegExp(
-    '<div[^>]+class="[^"]*property(?:_label|_value)?[^"]*"[^>]*>\\s*' + label + '\\s*(?:<\\/div>)?[\\s\\S]*?<div[^>]+class="[^"]*property_value[^"]*"[^>]*>([\\s\\S]*?)<\\/div>',
+    '<div[^>]+class="property_' + prop + '"[^>]*>([\\s\\S]*?)<\\/div>\\s*<\\/div>',
     'i'
   );
   var m = html.match(re);
-  if (m) return m[1];
-  var re2 = new RegExp(
-    '<span[^>]*>\\s*' + label + '\\s*(?::\\s*)?<\\/span>\\s*<span[^>]*>([\\s\\S]*?)<\\/span>',
-    'i'
-  );
-  m = html.match(re2);
-  return m ? m[1] : '';
+  if (!m) return '';
+  var valM = m[1].match(/<div[^>]+class="property_value"[^>]*>([\s\S]*?)<\/div>/i);
+  return valM ? _cleanText(valM[1]) : _cleanText(m[1]);
 }
 
 function _parseLinks(chunk) {
@@ -176,46 +187,66 @@ function getDetail(url) {
     }
     var html = r.body || '';
 
-    var titleM = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i) ||
-                 html.match(/<div[^>]+class="[^"]*bookTitle[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-    var title = titleM ? _cleanText(titleM[1]) : '';
+    var wrapM = html.match(/<div[^>]+class="row cardBooks"[^>]*>([\s\S]*)<\/body>/i);
+    var wrap = wrapM ? wrapM[1] : html;
 
-    var coverM = html.match(/<img[^>]+class="[^"]*cover[^"]*"[^>]+src="([^"]+)"/i) ||
-                 html.match(/<img[^>]+src="([^"]+\/covers\/[^"]+\.(?:jpg|jpeg|png|webp))"/i) ||
-                 html.match(/<img[^>]+itemprop="image"[^>]+src="([^"]+)"/i);
-    var cover = coverM ? absUrl(coverM[1], SITE) : null;
+    var zcoverM = html.match(/<z-cover\b([^>]*)>/i);
 
-    var descM = html.match(/<div[^>]+id="bookDescription[^"]*"[^>]*>([\s\S]*?)<\/div>/i) ||
-                html.match(/<div[^>]+class="[^"]*bookDescription[^"]*"[^>]*>([\s\S]*?)<\/div>/i) ||
-                html.match(/<div[^>]+itemprop="description"[^>]*>([\s\S]*?)<\/div>/i);
-    var description = descM ? _cleanText(descM[1]) : '';
-
-    var authors = _parseLinks(
-      _parseMetaField(html, 'Author') ||
-      _parseMetaField(html, 'Authors')
-    );
-    if (authors.length === 0) {
-      var authorBlockM = html.match(/<div[^>]+class="[^"]*authors?[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-      if (authorBlockM) authors = _parseLinks(authorBlockM[1]);
+    var title = '';
+    if (zcoverM) {
+      var titleAttr = zcoverM[1].match(/title="([\s\S]*?)"/i);
+      if (titleAttr) {
+        title = _cleanText(titleAttr[1]);
+      }
+    }
+    if (!title) {
+      var h1M = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+      title = h1M ? _cleanText(h1M[1]) : '';
     }
 
-    var year = _cleanText(_parseMetaField(html, 'Year') || _parseMetaField(html, 'Published'));
-    var publisher = _parseLinks(_parseMetaField(html, 'Publisher'));
-    var lang = _cleanText(_parseMetaField(html, 'Language') || _parseMetaField(html, 'Lang'));
-    var formatRaw = _cleanText(_parseMetaField(html, 'File') || _parseMetaField(html, 'Extension') || _parseMetaField(html, 'Format'));
-    var size = _cleanText(_parseMetaField(html, 'Size'));
-    var pages = _cleanText(_parseMetaField(html, 'Pages'));
+    var coverM = html.match(/<img[^>]+class="image"[^>]+src="([^"]+)"/i);
+    if (!coverM) coverM = html.match(/<z-cover[^>]*>[\s\S]*?<img[^>]+src="([^"]+)"/i);
+    var cover = coverM ? absUrl(coverM[1], SITE) : null;
 
-    var genres = _parseLinks(_parseMetaField(html, 'Category') || _parseMetaField(html, 'Categories'));
-    if (genres.length === 0) genres = _parseLinks(_parseMetaField(html, 'Tags'));
+    var descM = html.match(/<div[^>]+id="bookDescriptionBox"[^>]*>([\s\S]*?)<\/div>/i);
+    var description = descM ? _cleanText(descM[1]) : '';
+
+    var colM = wrap.match(/<div[^>]+class="col-sm-9"[^>]*>([\s\S]*?)<\/div>/i);
+    var authors = colM ? _parseLinks(colM[1]) : [];
+
+    var year = _parseDetailProperty(html, 'year');
+    var publisher = _parseDetailProperty(html, 'publisher');
+    var language = _parseDetailProperty(html, 'language');
+    var edition = _parseDetailProperty(html, 'edition');
+
+    var fileProp = _parseDetailProperty(html, '_file');
+    var extension = '';
+    var fileSize = '';
+    if (fileProp) {
+      var fileParts = fileProp.split(',');
+      if (fileParts.length >= 1) extension = fileParts[0].replace(/\s+/g, ' ').trim().toUpperCase();
+      if (fileParts.length >= 2) fileSize = fileParts[1].trim();
+    }
+
+    var categories = _parseDetailProperty(html, 'categories');
+
+    var downloadM = html.match(/<a[^>]+class="btn btn-default addDownloadedBook"[^>]+href="([^"]+)"/i);
+    var downloadUrl = downloadM ? absUrl(downloadM[1], SITE) : '';
+
+    var ratingM = html.match(/<div[^>]+class="book-rating"[^>]*>([\s\S]*?)<\/div>/i);
+    var rating = ratingM ? _cleanText(ratingM[1].replace(/\n/g, ' ')) : '';
 
     var extraInfo = [];
-    if (formatRaw) extraInfo.push(formatRaw.toUpperCase());
-    if (size) extraInfo.push(size);
-    if (pages) extraInfo.push(pages + ' pages');
-    if (lang) extraInfo.push(lang);
+    if (extension) extraInfo.push(extension);
+    if (fileSize) extraInfo.push(fileSize);
+    if (language) extraInfo.push(language);
     if (year) extraInfo.push(year);
-    if (publisher.length) extraInfo.push(publisher.join(', '));
+    if (publisher) extraInfo.push('Publisher: ' + publisher);
+    if (edition) extraInfo.push('Edition: ' + edition);
+    if (rating) extraInfo.push('Rating: ' + rating);
+    if (downloadUrl && downloadUrl.indexOf('unavailable') === -1) {
+      extraInfo.push('Download: ' + downloadUrl);
+    }
 
     if (extraInfo.length > 0 && description) {
       description = description + '\n\n---\n' + extraInfo.join(' | ');
@@ -226,13 +257,13 @@ function getDetail(url) {
     var chapters = [];
     chapters.push({
       id: _idFromUrl(url) + '__full',
-      title: title + (formatRaw ? ' (' + formatRaw.toUpperCase() + ')' : ''),
+      title: title + (extension ? ' (' + extension + ')' : ''),
       number: 1,
       url: url,
       date: year || ''
     });
 
-    console.log('zlibrary detail: title=' + title + ' author=' + authors.join(', '));
+    console.log('zlibrary detail: title=' + title + ' authors=' + authors.join(', '));
     return {
       id: _idFromUrl(url),
       sourceId: SOURCE_ID,
@@ -241,7 +272,7 @@ function getDetail(url) {
       url: url,
       description: description,
       status: 'completed',
-      genres: genres,
+      genres: categories ? [categories] : [],
       authors: authors,
       chapters: chapters,
       type: 'novel'
@@ -265,15 +296,21 @@ function getChapterContent(chapterUrl) {
     if (r.status !== 200) return { title: '', html: '', nextUrl: '', prevUrl: '' };
     var html = r.body || '';
 
-    var titleM = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
-    var title = titleM ? _cleanText(titleM[1]) : '';
+    var zcoverM = html.match(/<z-cover\b([^>]*)>/i);
+    var title = '';
+    if (zcoverM) {
+      var titleAttr = zcoverM[1].match(/title="([\s\S]*?)"/i);
+      if (titleAttr) title = _cleanText(titleAttr[1]);
+    }
+    if (!title) {
+      var h1M = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+      title = h1M ? _cleanText(h1M[1]) : '';
+    }
 
-    var descM = html.match(/<div[^>]+id="bookDescription[^"]*"[^>]*>([\s\S]*?)<\/div>/i) ||
-                html.match(/<div[^>]+class="[^"]*bookDescription[^"]*"[^>]*>([\s\S]*?)<\/div>/i) ||
-                html.match(/<div[^>]+itemprop="description"[^>]*>([\s\S]*?)<\/div>/i);
+    var descM = html.match(/<div[^>]+id="bookDescriptionBox"[^>]*>([\s\S]*?)<\/div>/i);
     var content = descM ? _cleanText(descM[1]) : '';
 
-    var downloadM = html.match(/<a[^>]+href="([^"]*(?:download|dl|get)[^"]*)"[^>]*>/i);
+    var downloadM = html.match(/<a[^>]+class="btn btn-default addDownloadedBook"[^>]+href="([^"]+)"/i);
     var downloadUrl = downloadM ? absUrl(downloadM[1], SITE) : '';
 
     if (downloadUrl && content) {
