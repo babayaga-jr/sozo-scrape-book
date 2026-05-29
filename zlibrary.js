@@ -25,7 +25,7 @@ function getInfo() {
     baseUrl: SITE,
     logo: SITE + '/favicon.ico',
     type: 'novel',
-    version: '1.2.0'
+    version: '1.3.0'
   };
 }
 
@@ -161,42 +161,53 @@ function _parseSetCookie(headers) {
   return m ? m[0] : '';
 }
 
-function _ensureSession() {
-  var userCookie = _getUserCookie();
-  if (userCookie) return Promise.resolve(userCookie);
-
-  if (_sessionCookie) return Promise.resolve(_sessionCookie);
-
+function _solveAndBuild() {
   return fetch(SITE + '/', {
     headers: { 'Referer': REFERER }
   }).then(function(r) {
     var html = r.body || '';
+    var bsrv = _parseSetCookie(r.headers);
 
-    if (r.status === 200 && html.indexOf('searchResultBox') !== -1) {
-      return '';
+    if (r.status === 200 && html.indexOf('Checking your browser') === -1) {
+      return bsrv;
     }
 
-    var bsrv = _parseSetCookie(r.headers);
     var challenge = _extractChallenge(html);
     if (!challenge) {
-      console.log('zlibrary: no challenge found, status=' + r.status);
-      return '';
+      console.log('zlibrary: no challenge, status=' + r.status);
+      return bsrv;
     }
 
     console.log('zlibrary: solving PoW');
     var token = _solvePow(challenge);
     if (!token) {
-      console.log('zlibrary: PoW solve failed');
-      return '';
+      console.log('zlibrary: PoW failed');
+      return bsrv;
     }
 
     var parts = [];
     if (bsrv) parts.push(bsrv);
     parts.push('c_token=' + token);
     parts.push('c_time=1');
-    _sessionCookie = parts.join('; ');
-    console.log('zlibrary: PoW session established');
-    return _sessionCookie;
+    console.log('zlibrary: PoW solved');
+    return parts.join('; ');
+  });
+}
+
+function _buildFullCookie(powCookie) {
+  var userCookie = _getUserCookie();
+  if (powCookie && userCookie) return powCookie + '; ' + userCookie;
+  if (userCookie) return userCookie;
+  if (powCookie) return powCookie;
+  return '';
+}
+
+function _ensureSession() {
+  if (_sessionCookie) return Promise.resolve(_sessionCookie);
+  return _solveAndBuild().then(function(powCookie) {
+    var full = _buildFullCookie(powCookie);
+    _sessionCookie = full;
+    return full;
   });
 }
 
@@ -204,7 +215,13 @@ function _zfetch(url) {
   return _ensureSession().then(function(cookie) {
     var headers = { 'Referer': REFERER };
     if (cookie) headers['Cookie'] = cookie;
-    return fetch(url, { headers: headers });
+    return fetch(url, { headers: headers }).then(function(r) {
+      if (r.body && r.body.indexOf('Checking your browser') !== -1) {
+        console.log('zlibrary: session expired, re-solving');
+        _sessionCookie = '';
+      }
+      return r;
+    });
   });
 }
 
