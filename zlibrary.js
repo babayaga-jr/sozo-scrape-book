@@ -13,7 +13,7 @@
 // which may not work reliably due to Z-Library's anti-bot protection.
 
 var SOURCE_ID = 'zlibrary';
-var SITE = 'https://z-library.sk';
+var SITE = 'https://z-library.im';
 var REFERER = SITE + '/';
 
 var _sessionCookie = '';
@@ -25,7 +25,7 @@ function getInfo() {
     baseUrl: SITE,
     logo: SITE + '/favicon.ico',
     type: 'novel',
-    version: '1.3.0'
+    version: '1.3.1'
   };
 }
 
