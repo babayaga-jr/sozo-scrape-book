@@ -1,0 +1,16 @@
+{
+  "name": "Black Providers",
+  "description": "Book and novel sources for Sozo Read.",
+  "sources": [
+    {
+      "id": "zlibrary",
+      "name": "Z-Library",
+      "version": "1.0.0",
+      "type": "novel",
+      "lang": "en",
+      "file": "zlibrary.js",
+      "logo": "https://singlelogin.re/favicon.ico",
+      "nsfw": false
+    }
+  ]
+}
