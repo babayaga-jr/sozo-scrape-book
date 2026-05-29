@@ -1,12 +1,16 @@
 // Z-Library provider — https://z-library.sk
 // Book library aggregator for Sozo Read.
 //
-// Z-Library protects every request with a SHA1 proof-of-work challenge.
-// This scraper solves it inline (pure ES5 SHA1 + PoW loop) and replays
-// the c_token cookie so subsequent requests return real content.
+// SETUP (required): Z-Library requires authentication.
+//   1. Open z-library.sk in your phone browser and log in
+//   2. Copy your browser cookies (use a "Copy Cookies" extension or
+//      export from browser dev tools)
+//   3. In Sozo Read → Settings → Sources → tap Z-Library → paste
+//      cookies into the "Session Cookies" field
+//   4. The cookies must include: remix_userkey, remix_userid
 //
-// NOTE: Z-Library rotates domains. Change SITE below if the mirror
-// changes. Known mirrors: z-library.sk
+// Without cookies, the provider attempts an automatic challenge bypass
+// which may not work reliably due to Z-Library's anti-bot protection.
 
 var SOURCE_ID = 'zlibrary';
 var SITE = 'https://z-library.sk';
@@ -21,8 +25,19 @@ function getInfo() {
     baseUrl: SITE,
     logo: SITE + '/favicon.ico',
     type: 'novel',
-    version: '1.1.0'
+    version: '1.2.0'
   };
+}
+
+function getSettings() {
+  return [
+    {
+      key: 'cookie',
+      label: 'Session Cookies — Log into z-library.sk in your browser, then copy all cookies and paste here',
+      type: 'text',
+      default: ''
+    }
+  ];
 }
 
 function _cleanText(s) {
@@ -53,21 +68,16 @@ function _getAttr(tag, name) {
 }
 
 // ======================================================================
-// Minimal SHA1 (pure ES5, no DOM) — needed for the anti-bot PoW.
+// Minimal SHA1 (pure ES5) — for anti-bot PoW fallback.
 // ======================================================================
 function _sha1Bytes(str) {
   var msg = [];
   for (var i = 0; i < str.length; i++) {
     var c = str.charCodeAt(i);
-    if (c < 0x80) {
-      msg.push(c);
-    } else if (c < 0x800) {
-      msg.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
-    } else {
-      msg.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
-    }
+    if (c < 0x80) msg.push(c);
+    else if (c < 0x800) msg.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+    else msg.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
   }
-
   var len = msg.length;
   msg.push(0x80);
   while (msg.length % 64 !== 56) msg.push(0);
@@ -79,9 +89,7 @@ function _sha1Bytes(str) {
     (bitLenLo >> 24) & 0xff, (bitLenLo >> 16) & 0xff,
     (bitLenLo >> 8) & 0xff, bitLenLo & 0xff
   );
-
   var H0 = 0x67452301, H1 = 0xEFCDAB89, H2 = 0x98BADCFE, H3 = 0x10325476, H4 = 0xC3D2E1F0;
-
   for (var offset = 0; offset < msg.length; offset += 64) {
     var w = [];
     for (var j = 0; j < 16; j++) {
@@ -92,21 +100,19 @@ function _sha1Bytes(str) {
       var n = w[j - 3] ^ w[j - 8] ^ w[j - 14] ^ w[j - 16];
       w[j] = ((n << 1) | (n >>> 31)) >>> 0;
     }
-
-    var a = H0, b = H1, c = H2, d = H3, e = H4;
+    var a = H0, b = H1, cc = H2, d = H3, e = H4;
     for (var j = 0; j < 80; j++) {
       var f, k;
-      if (j < 20) { f = (b & c) | ((~b) & d); k = 0x5A827999; }
-      else if (j < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
-      else if (j < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
-      else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+      if (j < 20) { f = (b & cc) | ((~b) & d); k = 0x5A827999; }
+      else if (j < 40) { f = b ^ cc ^ d; k = 0x6ED9EBA1; }
+      else if (j < 60) { f = (b & cc) | (b & d) | (cc & d); k = 0x8F1BBCDC; }
+      else { f = b ^ cc ^ d; k = 0xCA62C1D6; }
       var temp = (((a << 5) | (a >>> 27)) >>> 0) + f + e + k + w[j];
-      e = d; d = c; c = ((b << 30) | (b >>> 2)) >>> 0; b = a; a = temp >>> 0;
+      e = d; d = cc; cc = ((b << 30) | (b >>> 2)) >>> 0; b = a; a = temp >>> 0;
     }
-    H0 = (H0 + a) >>> 0; H1 = (H1 + b) >>> 0; H2 = (H2 + c) >>> 0;
+    H0 = (H0 + a) >>> 0; H1 = (H1 + b) >>> 0; H2 = (H2 + cc) >>> 0;
     H3 = (H3 + d) >>> 0; H4 = (H4 + e) >>> 0;
   }
-
   return [
     (H0 >> 24) & 0xff, (H0 >> 16) & 0xff, (H0 >> 8) & 0xff, H0 & 0xff,
     (H1 >> 24) & 0xff, (H1 >> 16) & 0xff, (H1 >> 8) & 0xff, H1 & 0xff,
@@ -117,11 +123,18 @@ function _sha1Bytes(str) {
 }
 
 // ======================================================================
-// Solve Z-Library's SHA1 proof-of-work challenge.
-// The 503 page embeds a 40-hex-char challenge string.  We append an
-// integer nonce, compute SHA1, and check two specific digest bytes.
-// When found we build the c_token cookie value.
+// Session management
 // ======================================================================
+function _getUserCookie() {
+  try {
+    var s = globalThis.__settings || {};
+    var cfg = s[__SOURCE_ID] || {};
+    var raw = (cfg.cookie || '').trim();
+    if (raw.length > 10) return raw;
+  } catch (e) {}
+  return '';
+}
+
 function _extractChallenge(html) {
   var m = html.match(/=['"]([A-Fa-f0-9]{40})['"]/);
   return m ? m[1].toUpperCase() : null;
@@ -129,56 +142,48 @@ function _extractChallenge(html) {
 
 function _solvePow(challenge) {
   var n1 = parseInt('0x' + challenge.charAt(0), 16);
-  var nonce = 0;
-  while (nonce < 5000000) {
-    var digest = _sha1Bytes(challenge + nonce);
-    if (digest[n1] === 0xb0 && digest[n1 + 1] === 0x0b) {
-      return challenge + nonce;
-    }
-    nonce++;
+  for (var nonce = 0; nonce < 2000000; nonce++) {
+    var d = _sha1Bytes(challenge + nonce);
+    if (d[n1] === 0xb0 && d[n1 + 1] === 0x0b) return challenge + nonce;
   }
   return null;
 }
 
-// ======================================================================
-// Session management — solve the PoW once, cache the cookie.
-// ======================================================================
-function _parseCookies(headers) {
-  var cookieStr = '';
-  if (!headers) return cookieStr;
-  if (typeof headers === 'string') {
-    var m = headers.match(/bsrv=[^;]+/i);
-    return m ? m[0] : '';
-  }
+function _parseSetCookie(headers) {
+  if (!headers) return '';
   if (typeof headers === 'object') {
-    var sc = headers['set-cookie'] || headers['Set-Cookie'] || '';
+    var sc = headers['set-cookie'] || '';
     if (Array.isArray(sc)) sc = sc.join('; ');
-    var m = sc.match(/bsrv=[^;]+/i);
+    var m = String(sc).match(/bsrv=[^;]+/i);
     return m ? m[0] : '';
   }
-  return cookieStr;
+  var m = String(headers).match(/bsrv=[^;]+/i);
+  return m ? m[0] : '';
 }
 
 function _ensureSession() {
+  var userCookie = _getUserCookie();
+  if (userCookie) return Promise.resolve(userCookie);
+
   if (_sessionCookie) return Promise.resolve(_sessionCookie);
 
   return fetch(SITE + '/', {
     headers: { 'Referer': REFERER }
   }).then(function(r) {
     var html = r.body || '';
-    var bsrv = _parseCookies(r.headers);
 
+    if (r.status === 200 && html.indexOf('searchResultBox') !== -1) {
+      return '';
+    }
+
+    var bsrv = _parseSetCookie(r.headers);
     var challenge = _extractChallenge(html);
     if (!challenge) {
-      if (r.status === 200 && html.indexOf('searchResultBox') !== -1) {
-        _sessionCookie = bsrv;
-        return _sessionCookie;
-      }
       console.log('zlibrary: no challenge found, status=' + r.status);
       return '';
     }
 
-    console.log('zlibrary: solving PoW challenge=' + challenge);
+    console.log('zlibrary: solving PoW');
     var token = _solvePow(challenge);
     if (!token) {
       console.log('zlibrary: PoW solve failed');
@@ -190,12 +195,12 @@ function _ensureSession() {
     parts.push('c_token=' + token);
     parts.push('c_time=1');
     _sessionCookie = parts.join('; ');
-    console.log('zlibrary: session established');
+    console.log('zlibrary: PoW session established');
     return _sessionCookie;
   });
 }
 
-function _fetch(url) {
+function _zfetch(url) {
   return _ensureSession().then(function(cookie) {
     var headers = { 'Referer': REFERER };
     if (cookie) headers['Cookie'] = cookie;
@@ -204,27 +209,32 @@ function _fetch(url) {
 }
 
 // ======================================================================
-// Provider functions
+// Search
 // ======================================================================
-
-function search(query, page, opts) {
+function search(query, page, category) {
   page = page || 1;
-  opts = opts || {};
-  var hasQuery = query && String(query).trim().length > 0;
-  if (!hasQuery) return [];
+  category = category || '';
+  var q = query && String(query).trim();
+  if (!q) return [];
 
-  var url = SITE + '/s/' + encodeURIComponent(String(query).trim()) + '?page=' + page;
-  console.log('zlibrary search url: ' + url);
+  var url = SITE + '/s/' + encodeURIComponent(q) + '?page=' + page;
+  console.log('zlibrary search: ' + url);
 
-  return _fetch(url).then(function(r) {
+  return _zfetch(url).then(function(r) {
     if (r.status !== 200) {
-      console.log('zlibrary search HTTP ' + r.status + ', retrying session');
+      console.log('zlibrary search HTTP ' + r.status);
       _sessionCookie = '';
       return [];
     }
     var html = r.body || '';
 
-    var notFound = html.match(/<div[^>]+class="[^"]*notFound[^"]*"/i);
+    if (html.indexOf('Checking your browser') !== -1) {
+      console.log('zlibrary: got challenge page, session expired');
+      _sessionCookie = '';
+      return [];
+    }
+
+    var notFound = html.match(/class="[^"]*notFound[^"]*"/i);
     if (notFound) return [];
 
     var results = [];
@@ -233,7 +243,41 @@ function search(query, page, opts) {
     var cardRe = /<z-bookcard\b([^>]*)>([\s\S]*?)<\/z-bookcard>/gi;
     var cards = _allMatches(html, cardRe);
 
-    if (cards.length === 0) {
+    for (var i = 0; i < cards.length; i++) {
+      var attrs = cards[i][1];
+      var inner = cards[i][2];
+
+      var href = _getAttr(attrs, 'href');
+      if (!href) continue;
+      var link = absUrl(href, SITE);
+      if (seen[link]) continue;
+      seen[link] = true;
+
+      var titleSlot = inner.match(/slot="title"[^>]*>([\s\S]*?)<\/div>/i);
+      var title = titleSlot ? _cleanText(titleSlot[1]) : '';
+      if (!title) continue;
+
+      var authorSlot = inner.match(/slot="author"[^>]*>([\s\S]*?)<\/div>/i);
+      var author = authorSlot ? _cleanText(authorSlot[1]) : '';
+
+      var ext = _getAttr(attrs, 'extension');
+      var coverM = inner.match(/data-src="([^"]+)"/i) || inner.match(/src="([^"]+)"/i);
+      var cover = coverM ? absUrl(coverM[1], SITE) : null;
+
+      var displayTitle = title;
+      if (ext) displayTitle = displayTitle + ' [' + ext.toUpperCase() + ']';
+      if (author) displayTitle = displayTitle + ' - ' + author;
+
+      results.push({
+        id: _idFromUrl(link),
+        title: displayTitle,
+        cover: cover,
+        url: link,
+        type: 'novel'
+      });
+    }
+
+    if (results.length === 0) {
       var fallbackRe = /<a[^>]+href="(\/book\/\d+\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
       var fms = _allMatches(html, fallbackRe);
       for (var fi = 0; fi < fms.length; fi++) {
@@ -250,61 +294,24 @@ function search(query, page, opts) {
           type: 'novel'
         });
       }
-      console.log('zlibrary search count (fallback): ' + results.length);
-      return results;
     }
 
-    for (var i = 0; i < cards.length; i++) {
-      var attrs = cards[i][1];
-      var inner = cards[i][2];
-
-      var href = _getAttr(attrs, 'href');
-      if (!href) continue;
-      var link = absUrl(href, SITE);
-      if (seen[link]) continue;
-      seen[link] = true;
-
-      var titleSlot = inner.match(/<div[^>]+slot="title"[^>]*>([\s\S]*?)<\/div>/i);
-      var title = titleSlot ? _cleanText(titleSlot[1]) : '';
-
-      var authorSlot = inner.match(/<div[^>]+slot="author"[^>]*>([\s\S]*?)<\/div>/i);
-      var authorRaw = authorSlot ? _cleanText(authorSlot[1]) : '';
-
-      var extension = _getAttr(attrs, 'extension');
-      var size = _getAttr(attrs, 'filesize');
-      var lang = _getAttr(attrs, 'language');
-      var year = _getAttr(attrs, 'year');
-
-      var coverM = inner.match(/<img[^>]+data-src="([^"]+)"/i) ||
-                   inner.match(/<img[^>]+src="([^"]+)"/i);
-      var cover = coverM ? absUrl(coverM[1], SITE) : null;
-
-      var displayTitle = title;
-      if (extension) displayTitle = displayTitle + ' [' + extension.toUpperCase() + ']';
-      if (authorRaw) displayTitle = displayTitle + ' — ' + authorRaw;
-
-      results.push({
-        id: _idFromUrl(link),
-        title: displayTitle,
-        cover: cover,
-        url: link,
-        type: 'novel'
-      });
-    }
     console.log('zlibrary search count: ' + results.length);
     return results;
   });
 }
 
-function _parseDetailProperty(html, prop) {
+// ======================================================================
+// Detail
+// ======================================================================
+function _parseProp(html, prop) {
   var re = new RegExp(
-    '<div[^>]+class="property_' + prop + '"[^>]*>([\\s\\S]*?)<\\/div>\\s*<\\/div>',
-    'i'
+    'class="property_' + prop + '"[^>]*>([\\s\\S]*?)</div>\\s*</div>', 'i'
   );
   var m = html.match(re);
   if (!m) return '';
-  var valM = m[1].match(/<div[^>]+class="property_value"[^>]*>([\s\S]*?)<\/div>/i);
-  return valM ? _cleanText(valM[1]) : _cleanText(m[1]);
+  var v = m[1].match(/class="property_value"[^>]*>([\s\S]*?)<\/div>/i);
+  return v ? _cleanText(v[1]) : _cleanText(m[1]);
 }
 
 function _parseLinks(chunk) {
@@ -323,67 +330,61 @@ function _parseLinks(chunk) {
 }
 
 function getDetail(url) {
-  console.log('zlibrary detail url: ' + url);
-  return _fetch(url).then(function(r) {
-    if (r.status !== 200) {
-      throw new Error('detail HTTP ' + r.status);
-    }
+  console.log('zlibrary detail: ' + url);
+  return _zfetch(url).then(function(r) {
+    if (r.status !== 200) throw new Error('detail HTTP ' + r.status);
     var html = r.body || '';
 
     var title = '';
     var zcoverM = html.match(/<z-cover\b([^>]*)>/i);
     if (zcoverM) {
-      var titleAttr = zcoverM[1].match(/title="([\s\S]*?)"/i);
-      if (titleAttr) title = _cleanText(titleAttr[1]);
+      var ta = zcoverM[1].match(/title="([\s\S]*?)"/i);
+      if (ta) title = _cleanText(ta[1]);
     }
     if (!title) {
-      var h1M = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
-      title = h1M ? _cleanText(h1M[1]) : '';
+      var h1 = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+      title = h1 ? _cleanText(h1[1]) : 'Unknown';
     }
 
-    var coverM = html.match(/<img[^>]+class="image"[^>]+src="([^"]+)"/i);
-    if (!coverM) coverM = html.match(/<z-cover[^>]*>[\s\S]*?<img[^>]+src="([^"]+)"/i);
+    var coverM = html.match(/class="image"[^>]+src="([^"]+)"/i) ||
+                 html.match(/<z-cover[^>]*>[\s\S]*?<img[^>]+src="([^"]+)"/i);
     var cover = coverM ? absUrl(coverM[1], SITE) : null;
 
-    var descM = html.match(/<div[^>]+id="bookDescriptionBox"[^>]*>([\s\S]*?)<\/div>/i);
+    var descM = html.match(/id="bookDescriptionBox"[^>]*>([\s\S]*?)<\/div>/i);
     var description = descM ? _cleanText(descM[1]) : '';
 
-    var colM = html.match(/<div[^>]+class="col-sm-9"[^>]*>([\s\S]*?)<\/div>/i);
+    var colM = html.match(/class="col-sm-9"[^>]*>([\s\S]*?)<\/div>/i);
     var authors = colM ? _parseLinks(colM[1]) : [];
 
-    var year = _parseDetailProperty(html, 'year');
-    var publisher = _parseDetailProperty(html, 'publisher');
-    var language = _parseDetailProperty(html, 'language');
-    var edition = _parseDetailProperty(html, 'edition');
+    var year = _parseProp(html, 'year');
+    var publisher = _parseProp(html, 'publisher');
+    var language = _parseProp(html, 'language');
 
-    var fileProp = _parseDetailProperty(html, '_file');
+    var fileProp = _parseProp(html, '_file');
     var extension = '';
     var fileSize = '';
     if (fileProp) {
-      var fileParts = fileProp.split(',');
-      if (fileParts.length >= 1) extension = fileParts[0].replace(/\s+/g, ' ').trim().toUpperCase();
-      if (fileParts.length >= 2) fileSize = fileParts[1].trim();
+      var fp = fileProp.split(',');
+      extension = fp[0].trim().toUpperCase();
+      if (fp.length >= 2) fileSize = fp[1].trim();
     }
 
-    var categories = _parseDetailProperty(html, 'categories');
+    var categories = _parseProp(html, 'categories');
 
-    var downloadM = html.match(/<a[^>]+class="btn btn-default addDownloadedBook"[^>]+href="([^"]+)"/i);
-    var downloadUrl = downloadM ? absUrl(downloadM[1], SITE) : '';
+    var dlM = html.match(/class="btn btn-default addDownloadedBook"[^>]+href="([^"]+)"/i);
+    var downloadUrl = dlM ? absUrl(dlM[1], SITE) : '';
 
-    var extraInfo = [];
-    if (extension) extraInfo.push(extension);
-    if (fileSize) extraInfo.push(fileSize);
-    if (language) extraInfo.push(language);
-    if (year) extraInfo.push(year);
-    if (publisher) extraInfo.push('Publisher: ' + publisher);
+    var extra = [];
+    if (extension) extra.push(extension);
+    if (fileSize) extra.push(fileSize);
+    if (language) extra.push(language);
+    if (year) extra.push(year);
+    if (publisher) extra.push('Publisher: ' + publisher);
     if (downloadUrl && downloadUrl.indexOf('unavailable') === -1) {
-      extraInfo.push('Download: ' + downloadUrl);
+      extra.push('Download: ' + downloadUrl);
     }
-
-    if (extraInfo.length > 0 && description) {
-      description = description + '\n\n---\n' + extraInfo.join(' | ');
-    } else if (extraInfo.length > 0 && !description) {
-      description = extraInfo.join(' | ');
+    if (extra.length > 0) {
+      description = description ? description + '\n\n---\n' + extra.join(' | ') : extra.join(' | ');
     }
 
     var chapters = [];
@@ -395,10 +396,9 @@ function getDetail(url) {
       date: year || ''
     });
 
-    console.log('zlibrary detail: title=' + title + ' authors=' + authors.join(', '));
+    console.log('zlibrary detail: ' + title);
     return {
       id: _idFromUrl(url),
-      sourceId: SOURCE_ID,
       title: title,
       cover: cover,
       url: url,
@@ -421,30 +421,31 @@ function getPages(chapterUrl) {
 }
 
 function getChapterContent(chapterUrl) {
-  console.log('zlibrary chapter content url: ' + chapterUrl);
-  return _fetch(chapterUrl).then(function(r) {
-    if (r.status !== 200) return { text: '', nextUrl: '' };
+  console.log('zlibrary content: ' + chapterUrl);
+  return _zfetch(chapterUrl).then(function(r) {
+    if (r.status !== 200) return { text: 'Failed to load content.', nextUrl: null };
+
     var html = r.body || '';
 
     var title = '';
     var zcoverM = html.match(/<z-cover\b([^>]*)>/i);
     if (zcoverM) {
-      var titleAttr = zcoverM[1].match(/title="([\s\S]*?)"/i);
-      if (titleAttr) title = _cleanText(titleAttr[1]);
+      var ta = zcoverM[1].match(/title="([\s\S]*?)"/i);
+      if (ta) title = _cleanText(ta[1]);
     }
 
-    var descM = html.match(/<div[^>]+id="bookDescriptionBox"[^>]*>([\s\S]*?)<\/div>/i);
-    var content = descM ? _cleanText(descM[1]) : '';
+    var descM = html.match(/id="bookDescriptionBox"[^>]*>([\s\S]*?)<\/div>/i);
+    var desc = descM ? _cleanText(descM[1]) : '';
 
-    var downloadM = html.match(/<a[^>]+class="btn btn-default addDownloadedBook"[^>]+href="([^"]+)"/i);
-    var downloadUrl = downloadM ? absUrl(downloadM[1], SITE) : '';
+    var dlM = html.match(/class="btn btn-default addDownloadedBook"[^>]+href="([^"]+)"/i);
+    var dlUrl = dlM ? absUrl(dlM[1], SITE) : '';
 
-    if (downloadUrl && content) {
-      content = content + '\n\n---\nDownload: ' + downloadUrl;
-    } else if (downloadUrl && !content) {
-      content = 'Download: ' + downloadUrl;
-    }
+    var parts = [];
+    if (title) parts.push(title);
+    if (desc) parts.push(desc);
+    if (dlUrl && dlUrl.indexOf('unavailable') === -1) parts.push('Download: ' + dlUrl);
 
-    return { text: title + '\n\n' + content, nextUrl: '' };
+    var text = parts.length > 0 ? parts.join('\n\n') : 'No content available.';
+    return { text: text, nextUrl: null };
   });
 }

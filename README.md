@@ -18,6 +18,15 @@ Sozo Read provider repo for book sources. Each `.js` file is a self-contained sc
 |------|------|------|
 | `zlibrary.js` | Z-Library (`z-library.sk`) | novel (book library) |
 
+## Z-Library Setup (required)
+
+Z-Library requires authentication cookies to search and view books. Without them, search will return no results.
+
+1. Open **z-library.sk** in your phone's browser and **log in** (create a free account if needed)
+2. Copy your browser cookies from Z-Library. On Android, you can use a "Copy Cookies" browser extension, or open `chrome://inspect` on desktop to grab cookies from a connected phone
+3. In Sozo Read: **Settings → Sources → tap Z-Library → Session Cookies** — paste all cookies there
+4. The pasted cookies must include `remix_userkey` and `remix_userid`
+
 ## Adding a new source
 
 1. Copy `_template.js` from the [upstream repo](https://github.com/Spyou/sozoread-providers) or an existing scraper
