@@ -1,18 +1,18 @@
 // Z-Library provider — https://z-library.sk
-// Book library aggregator. Type is set to 'novel' as the closest match
-// within the Sozo Read provider contract.
+// Book library aggregator for Sozo Read.
 //
-// The site uses custom web components (<z-bookcard>, <z-cover>) where
-// most data lives as HTML attributes rather than nested text nodes —
-// ideal for regex-based parsing.
+// Z-Library protects every request with a SHA1 proof-of-work challenge.
+// This scraper solves it inline (pure ES5 SHA1 + PoW loop) and replays
+// the c_token cookie so subsequent requests return real content.
 //
-// NOTE: Z-Library rotates domains. Change SITE below if the current
-// mirror stops working. Known mirrors: z-library.sk, singlelogin.re,
-// zlibrary-global.se
+// NOTE: Z-Library rotates domains. Change SITE below if the mirror
+// changes. Known mirrors: z-library.sk
 
 var SOURCE_ID = 'zlibrary';
 var SITE = 'https://z-library.sk';
 var REFERER = SITE + '/';
+
+var _sessionCookie = '';
 
 function getInfo() {
   return {
@@ -21,7 +21,7 @@ function getInfo() {
     baseUrl: SITE,
     logo: SITE + '/favicon.ico',
     type: 'novel',
-    version: '1.0.0'
+    version: '1.1.0'
   };
 }
 
@@ -52,15 +52,161 @@ function _getAttr(tag, name) {
   return m ? _cleanText(m[1]) : '';
 }
 
-// ----------------------------------------------------------------------
-// Search: /s/{query}?page=N
-// Results live inside <div id="searchResultBox"> → <div class="book-item">
-// → <z-bookcard href="..." id="..." extension="..." filesize="..." ...>
-//   <div slot="title">Title</div>
-//   <div slot="author">Author1; Author2</div>
-//   <img data-src="cover_url">
-// </z-bookcard>
-// ----------------------------------------------------------------------
+// ======================================================================
+// Minimal SHA1 (pure ES5, no DOM) — needed for the anti-bot PoW.
+// ======================================================================
+function _sha1Bytes(str) {
+  var msg = [];
+  for (var i = 0; i < str.length; i++) {
+    var c = str.charCodeAt(i);
+    if (c < 0x80) {
+      msg.push(c);
+    } else if (c < 0x800) {
+      msg.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+    } else {
+      msg.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+    }
+  }
+
+  var len = msg.length;
+  msg.push(0x80);
+  while (msg.length % 64 !== 56) msg.push(0);
+  var bitLenHi = Math.floor(len / 536870912);
+  var bitLenLo = (len << 3) >>> 0;
+  msg.push(
+    (bitLenHi >> 24) & 0xff, (bitLenHi >> 16) & 0xff,
+    (bitLenHi >> 8) & 0xff, bitLenHi & 0xff,
+    (bitLenLo >> 24) & 0xff, (bitLenLo >> 16) & 0xff,
+    (bitLenLo >> 8) & 0xff, bitLenLo & 0xff
+  );
+
+  var H0 = 0x67452301, H1 = 0xEFCDAB89, H2 = 0x98BADCFE, H3 = 0x10325476, H4 = 0xC3D2E1F0;
+
+  for (var offset = 0; offset < msg.length; offset += 64) {
+    var w = [];
+    for (var j = 0; j < 16; j++) {
+      w[j] = (msg[offset + j * 4] << 24) | (msg[offset + j * 4 + 1] << 16) |
+             (msg[offset + j * 4 + 2] << 8) | msg[offset + j * 4 + 3];
+    }
+    for (var j = 16; j < 80; j++) {
+      var n = w[j - 3] ^ w[j - 8] ^ w[j - 14] ^ w[j - 16];
+      w[j] = ((n << 1) | (n >>> 31)) >>> 0;
+    }
+
+    var a = H0, b = H1, c = H2, d = H3, e = H4;
+    for (var j = 0; j < 80; j++) {
+      var f, k;
+      if (j < 20) { f = (b & c) | ((~b) & d); k = 0x5A827999; }
+      else if (j < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+      else if (j < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+      else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+      var temp = (((a << 5) | (a >>> 27)) >>> 0) + f + e + k + w[j];
+      e = d; d = c; c = ((b << 30) | (b >>> 2)) >>> 0; b = a; a = temp >>> 0;
+    }
+    H0 = (H0 + a) >>> 0; H1 = (H1 + b) >>> 0; H2 = (H2 + c) >>> 0;
+    H3 = (H3 + d) >>> 0; H4 = (H4 + e) >>> 0;
+  }
+
+  return [
+    (H0 >> 24) & 0xff, (H0 >> 16) & 0xff, (H0 >> 8) & 0xff, H0 & 0xff,
+    (H1 >> 24) & 0xff, (H1 >> 16) & 0xff, (H1 >> 8) & 0xff, H1 & 0xff,
+    (H2 >> 24) & 0xff, (H2 >> 16) & 0xff, (H2 >> 8) & 0xff, H2 & 0xff,
+    (H3 >> 24) & 0xff, (H3 >> 16) & 0xff, (H3 >> 8) & 0xff, H3 & 0xff,
+    (H4 >> 24) & 0xff, (H4 >> 16) & 0xff, (H4 >> 8) & 0xff, H4 & 0xff
+  ];
+}
+
+// ======================================================================
+// Solve Z-Library's SHA1 proof-of-work challenge.
+// The 503 page embeds a 40-hex-char challenge string.  We append an
+// integer nonce, compute SHA1, and check two specific digest bytes.
+// When found we build the c_token cookie value.
+// ======================================================================
+function _extractChallenge(html) {
+  var m = html.match(/=['"]([A-Fa-f0-9]{40})['"]/);
+  return m ? m[1].toUpperCase() : null;
+}
+
+function _solvePow(challenge) {
+  var n1 = parseInt('0x' + challenge.charAt(0), 16);
+  var nonce = 0;
+  while (nonce < 5000000) {
+    var digest = _sha1Bytes(challenge + nonce);
+    if (digest[n1] === 0xb0 && digest[n1 + 1] === 0x0b) {
+      return challenge + nonce;
+    }
+    nonce++;
+  }
+  return null;
+}
+
+// ======================================================================
+// Session management — solve the PoW once, cache the cookie.
+// ======================================================================
+function _parseCookies(headers) {
+  var cookieStr = '';
+  if (!headers) return cookieStr;
+  if (typeof headers === 'string') {
+    var m = headers.match(/bsrv=[^;]+/i);
+    return m ? m[0] : '';
+  }
+  if (typeof headers === 'object') {
+    var sc = headers['set-cookie'] || headers['Set-Cookie'] || '';
+    if (Array.isArray(sc)) sc = sc.join('; ');
+    var m = sc.match(/bsrv=[^;]+/i);
+    return m ? m[0] : '';
+  }
+  return cookieStr;
+}
+
+function _ensureSession() {
+  if (_sessionCookie) return Promise.resolve(_sessionCookie);
+
+  return fetch(SITE + '/', {
+    headers: { 'Referer': REFERER }
+  }).then(function(r) {
+    var html = r.body || '';
+    var bsrv = _parseCookies(r.headers);
+
+    var challenge = _extractChallenge(html);
+    if (!challenge) {
+      if (r.status === 200 && html.indexOf('searchResultBox') !== -1) {
+        _sessionCookie = bsrv;
+        return _sessionCookie;
+      }
+      console.log('zlibrary: no challenge found, status=' + r.status);
+      return '';
+    }
+
+    console.log('zlibrary: solving PoW challenge=' + challenge);
+    var token = _solvePow(challenge);
+    if (!token) {
+      console.log('zlibrary: PoW solve failed');
+      return '';
+    }
+
+    var parts = [];
+    if (bsrv) parts.push(bsrv);
+    parts.push('c_token=' + token);
+    parts.push('c_time=1');
+    _sessionCookie = parts.join('; ');
+    console.log('zlibrary: session established');
+    return _sessionCookie;
+  });
+}
+
+function _fetch(url) {
+  return _ensureSession().then(function(cookie) {
+    var headers = { 'Referer': REFERER };
+    if (cookie) headers['Cookie'] = cookie;
+    return fetch(url, { headers: headers });
+  });
+}
+
+// ======================================================================
+// Provider functions
+// ======================================================================
+
 function search(query, page, opts) {
   page = page || 1;
   opts = opts || {};
@@ -70,13 +216,12 @@ function search(query, page, opts) {
   var url = SITE + '/s/' + encodeURIComponent(String(query).trim()) + '?page=' + page;
   console.log('zlibrary search url: ' + url);
 
-  return fetch(url, {
-    headers: {
-      'Accept': 'text/html,application/xhtml+xml',
-      'Referer': REFERER
+  return _fetch(url).then(function(r) {
+    if (r.status !== 200) {
+      console.log('zlibrary search HTTP ' + r.status + ', retrying session');
+      _sessionCookie = '';
+      return [];
     }
-  }).then(function(r) {
-    if (r.status !== 200) return [];
     var html = r.body || '';
 
     var notFound = html.match(/<div[^>]+class="[^"]*notFound[^"]*"/i);
@@ -87,6 +232,27 @@ function search(query, page, opts) {
 
     var cardRe = /<z-bookcard\b([^>]*)>([\s\S]*?)<\/z-bookcard>/gi;
     var cards = _allMatches(html, cardRe);
+
+    if (cards.length === 0) {
+      var fallbackRe = /<a[^>]+href="(\/book\/\d+\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+      var fms = _allMatches(html, fallbackRe);
+      for (var fi = 0; fi < fms.length; fi++) {
+        var fLink = absUrl(fms[fi][1], SITE);
+        if (seen[fLink]) continue;
+        seen[fLink] = true;
+        var fTitle = _cleanText(fms[fi][2]);
+        if (!fTitle || fTitle.length < 2) continue;
+        results.push({
+          id: _idFromUrl(fLink),
+          title: fTitle,
+          cover: null,
+          url: fLink,
+          type: 'novel'
+        });
+      }
+      console.log('zlibrary search count (fallback): ' + results.length);
+      return results;
+    }
 
     for (var i = 0; i < cards.length; i++) {
       var attrs = cards[i][1];
@@ -130,27 +296,6 @@ function search(query, page, opts) {
   });
 }
 
-// ----------------------------------------------------------------------
-// Detail page: /book/{id}/{slug}
-// Structure:
-//   <div class="row cardBooks">
-//     <z-cover title="Book Title">
-//       <img class="image" src="cover_url">
-//     </z-cover>
-//     <div class="col-sm-9">
-//       <a href="/s/author">Author Name</a>  (one or more)
-//     </div>
-//     <div id="bookDescriptionBox">Description text</div>
-//     <div class="bookDetailsBox">
-//       <div class="property_year"><div class="property_value">2024</div></div>
-//       <div class="property_publisher"><div class="property_value">...</div></div>
-//       <div class="property_language"><div class="property_value">...</div></div>
-//       <div class="property__file">PDF, 5.4 MB</div>
-//       <div class="property_categories"><div class="property_value">...</div></div>
-//     </div>
-//     <a class="btn btn-default addDownloadedBook" href="/dl/...">Download</a>
-//   </div>
-// ----------------------------------------------------------------------
 function _parseDetailProperty(html, prop) {
   var re = new RegExp(
     '<div[^>]+class="property_' + prop + '"[^>]*>([\\s\\S]*?)<\\/div>\\s*<\\/div>',
@@ -179,25 +324,17 @@ function _parseLinks(chunk) {
 
 function getDetail(url) {
   console.log('zlibrary detail url: ' + url);
-  return fetch(url, {
-    headers: { 'Referer': REFERER }
-  }).then(function(r) {
+  return _fetch(url).then(function(r) {
     if (r.status !== 200) {
       throw new Error('detail HTTP ' + r.status);
     }
     var html = r.body || '';
 
-    var wrapM = html.match(/<div[^>]+class="row cardBooks"[^>]*>([\s\S]*)<\/body>/i);
-    var wrap = wrapM ? wrapM[1] : html;
-
-    var zcoverM = html.match(/<z-cover\b([^>]*)>/i);
-
     var title = '';
+    var zcoverM = html.match(/<z-cover\b([^>]*)>/i);
     if (zcoverM) {
       var titleAttr = zcoverM[1].match(/title="([\s\S]*?)"/i);
-      if (titleAttr) {
-        title = _cleanText(titleAttr[1]);
-      }
+      if (titleAttr) title = _cleanText(titleAttr[1]);
     }
     if (!title) {
       var h1M = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
@@ -211,7 +348,7 @@ function getDetail(url) {
     var descM = html.match(/<div[^>]+id="bookDescriptionBox"[^>]*>([\s\S]*?)<\/div>/i);
     var description = descM ? _cleanText(descM[1]) : '';
 
-    var colM = wrap.match(/<div[^>]+class="col-sm-9"[^>]*>([\s\S]*?)<\/div>/i);
+    var colM = html.match(/<div[^>]+class="col-sm-9"[^>]*>([\s\S]*?)<\/div>/i);
     var authors = colM ? _parseLinks(colM[1]) : [];
 
     var year = _parseDetailProperty(html, 'year');
@@ -233,17 +370,12 @@ function getDetail(url) {
     var downloadM = html.match(/<a[^>]+class="btn btn-default addDownloadedBook"[^>]+href="([^"]+)"/i);
     var downloadUrl = downloadM ? absUrl(downloadM[1], SITE) : '';
 
-    var ratingM = html.match(/<div[^>]+class="book-rating"[^>]*>([\s\S]*?)<\/div>/i);
-    var rating = ratingM ? _cleanText(ratingM[1].replace(/\n/g, ' ')) : '';
-
     var extraInfo = [];
     if (extension) extraInfo.push(extension);
     if (fileSize) extraInfo.push(fileSize);
     if (language) extraInfo.push(language);
     if (year) extraInfo.push(year);
     if (publisher) extraInfo.push('Publisher: ' + publisher);
-    if (edition) extraInfo.push('Edition: ' + edition);
-    if (rating) extraInfo.push('Rating: ' + rating);
     if (downloadUrl && downloadUrl.indexOf('unavailable') === -1) {
       extraInfo.push('Download: ' + downloadUrl);
     }
@@ -290,21 +422,15 @@ function getPages(chapterUrl) {
 
 function getChapterContent(chapterUrl) {
   console.log('zlibrary chapter content url: ' + chapterUrl);
-  return fetch(chapterUrl, {
-    headers: { 'Referer': REFERER }
-  }).then(function(r) {
-    if (r.status !== 200) return { title: '', html: '', nextUrl: '', prevUrl: '' };
+  return _fetch(chapterUrl).then(function(r) {
+    if (r.status !== 200) return { text: '', nextUrl: '' };
     var html = r.body || '';
 
-    var zcoverM = html.match(/<z-cover\b([^>]*)>/i);
     var title = '';
+    var zcoverM = html.match(/<z-cover\b([^>]*)>/i);
     if (zcoverM) {
       var titleAttr = zcoverM[1].match(/title="([\s\S]*?)"/i);
       if (titleAttr) title = _cleanText(titleAttr[1]);
-    }
-    if (!title) {
-      var h1M = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
-      title = h1M ? _cleanText(h1M[1]) : '';
     }
 
     var descM = html.match(/<div[^>]+id="bookDescriptionBox"[^>]*>([\s\S]*?)<\/div>/i);
@@ -319,11 +445,6 @@ function getChapterContent(chapterUrl) {
       content = 'Download: ' + downloadUrl;
     }
 
-    return {
-      title: title,
-      html: content,
-      nextUrl: '',
-      prevUrl: ''
-    };
+    return { text: title + '\n\n' + content, nextUrl: '' };
   });
 }
